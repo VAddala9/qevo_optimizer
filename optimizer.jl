@@ -1,7 +1,8 @@
-using QuantumClifford
 using BPGates
-using PyPlot
+using QuantumClifford
 using QuantumClifford.Experimental.NoisyCircuits
+using Random
+using PyPlot
 
 struct Performance
     error_probabilities::Vector{Float64}
@@ -10,8 +11,8 @@ end
 
 mutable struct Individual
     history::String
-    k::UInt8
-    r::UInt8
+    k::Int
+    r::Int
     f_in::Float64
     cost_function # function that takes in Performance type and returns a number
     ops::Vector{Any}
@@ -26,13 +27,9 @@ end
 
 p_zero(p::Performance)=p.error_probabilities[1]
 p_one_zero(p::Performance)=sum(p.error_probabilities[1:2])
-p_one_zero_two(p::Performance)=sum(p.error_probabilities[1:3])
+p_two_one_zero(p::Performance)=sum(p.error_probabilities[1:3])
     
-function simulate_circuit(indiv::Individual, num_simulations)
-    return SimulationObject([rand([true, false]) for i=1:num_simulations], [rand_state(indiv.r) for i=1:num_simulations])
-end
-
-function calculate_performance(indiv::Individual, num_simulations=10) # later pass in min_accuracy instead of num_simulations
+function calculate_performance!(indiv::Individual, num_simulations=10) # later pass in min_accuracy instead of num_simulations
     all_resulting_pairs = Vector{BellState}()
     all_successes = Vector{Bool}()
     for i=1:num_simulations
@@ -44,26 +41,13 @@ function calculate_performance(indiv::Individual, num_simulations=10) # later pa
     successful_runs = (all_successes .== 1)
     successes = sum(successful_runs)
     if successes == 0
-        return 0.0
+        return indiv.fitness = 0.0
     end
     success_probability = successes/num_simulations
     errors = [sum(all_resulting_pairs[i].phases[1:2:2*indiv.k] .| all_resulting_pairs[i].phases[2:2:2*indiv.k]) for i=1:num_simulations if successful_runs[i]]
     error_probabilities = [sum(errors .== i)/successes for i=0:indiv.k] # TODO - split and then benchmark
     indiv.performance = Performance(error_probabilities, success_probability)
     indiv.fitness = indiv.cost_function(indiv.performance)
-end
-
-function random_bell_op(registers::UInt8)
-    register1 = rand(1:registers)
-    register2 = rand(1:registers)
-    while register1 == register2
-        register2 = rand(1:registers)
-    end
-
-    if rand() < 0.6
-        return BellGateQC(rand(1:4), rand(1:20), rand(1:6), rand(1:6), register1, register2)
-    end
-    return BellMeasure(rand(1:3), rand(1:registers))
 end
 
 function drop_op(indiv::Individual) 
@@ -73,9 +57,11 @@ function drop_op(indiv::Individual)
     return new_indiv
 end
 
-function gain_op(indiv::Individual)
+function gain_op(indiv::Individual, p2::Float64)
     new_indiv = deepcopy(indiv)
-    insert!(new_indiv.ops, rand(1:length(new_indiv.ops)), random_bell_op(new_indiv.r))
+    px = py = pz = (1 - p2)/4
+    rand_op = rand() < 0.7 ? PauliNoiseBellGate(rand(BellGate, randperm(indiv.k)[1:2]...), px, py, pz) : rand(BellMeasure, rand(1:indiv.k))
+    insert!(new_indiv.ops, rand(1:length(new_indiv.ops)), rand_op)
     new_indiv.history = "gain_m"
     return new_indiv
 end
@@ -91,11 +77,11 @@ function swap_op(indiv::Individual)
 end
 
 function mutate(gate::BellMeasure)
-    return BellMeasure(rand(1:3), gate.sidx)
+    return rand(BellMeasure, gate.sidx)
 end
 
-function mutate(gate::BellGateQC)
-    return BellGateQC(rand(1:4), rand(1:20), rand(1:6), rand(1:6), gate.idx1, gate.idx2)
+function mutate(gate::PauliNoiseBellGate)
+    return PauliNoiseBellGate(rand(BellGate, gate.g.idx1, gate.g.idx2), gate.px, gate.py, gate.pz)
 end
 
 function mutate(indiv::Individual)
@@ -129,21 +115,21 @@ function generate_dataframe() # priority 3
 end
 
 mutable struct Population
-    n::UInt8
-    k::UInt8
-    r::UInt8
+    n::Int
+    k::Int
+    r::Int
     cost_function
     f_in::Float64
     p2::Float64
     η::Float64
-    population_size::UInt32
-    starting_pop_multiplier::UInt32
-    max_gen::UInt32
-    max_ops::UInt8
-    starting_ops::UInt8
-    pairs::UInt8
-    children_per_pair::UInt8
-    mutants_per_individual_per_type::UInt8
+    population_size::Int
+    starting_pop_multiplier::Int
+    max_gen::Int
+    max_ops::Int
+    starting_ops::Int
+    pairs::Int
+    children_per_pair::Int
+    mutants_per_individual_per_type::Int
     p_single_operation_mutates::Float64
     p_lose_operation::Float64
     p_add_operation::Float64
@@ -151,11 +137,21 @@ mutable struct Population
     p_mutate_operations::Float64
     individuals::Vector{Individual}
     selection_history::Dict{Tuple{Int64, String}, Int64}
-    num_simulations::UInt32
+    num_simulations::Int
 end
 
-function initialize_pop(population::Population)
-    population.individuals = [Individual("random", population.k, population.r, population.f_in, population.cost_function, [random_bell_op(population.r) for j=1:population.starting_ops], Performance([], 0.0), 0.0) for i=1:population.population_size*population.starting_pop_multiplier]
+function initialize_pop!(population::Population)
+    population.individuals = [Individual("random", population.k, population.r, population.f_in, population.cost_function, [], Performance([], 0.0), 0.0) for i=1:population.population_size*population.starting_pop_multiplier]
+    Threads.@threads for indiv in population.individuals
+        num_gates = rand(1:population.starting_ops-1)
+        random_gates = [rand(BellGate, (randperm(population.r)[1:2])...) for _ in 1:num_gates]
+        px = py = pz = (1 - population.p2)/4
+        noisy_random_gates = [PauliNoiseBellGate(g, px, py, pz) for g in random_gates]
+        random_measurements = [rand(BellMeasure, rand(1:population.r)) for _ in 1:(population.starting_ops-num_gates)]
+        all_ops = vcat(noisy_random_gates, random_measurements)
+        random_circuit = all_ops[randperm(population.starting_ops)]
+        indiv.ops = random_circuit
+    end
 end
 
 function cull!(population::Population)
@@ -164,12 +160,12 @@ end
 
 function sort!(population::Population) 
     Threads.@threads for indiv in population.individuals
-        calculate_performance(indiv, population.num_simulations) 
+        calculate_performance!(indiv, population.num_simulations) 
     end
     population.individuals = sort(population.individuals, by = x -> x.fitness, rev=true)
 end
 
-function step(population::Population)
+function step!(population::Population)
     for indiv in population.individuals
         indiv.history = "survivor"
     end
@@ -181,7 +177,7 @@ function step(population::Population)
 
     for indiv in population.individuals[1:population.population_size]
         population.individuals = vcat(population.individuals, [drop_op(indiv) for i=1:population.mutants_per_individual_per_type if rand() < population.p_lose_operation && length(indiv.ops) > 0])
-        population.individuals = vcat(population.individuals, [gain_op(indiv) for i=1:population.mutants_per_individual_per_type if rand() < population.p_add_operation && length(indiv.ops) < population.max_ops])
+        population.individuals = vcat(population.individuals, [gain_op(indiv, population.p2) for i=1:population.mutants_per_individual_per_type if rand() < population.p_add_operation && length(indiv.ops) < population.max_ops])
         population.individuals = vcat(population.individuals, [swap_op(indiv) for i=1:population.mutants_per_individual_per_type if rand() < population.p_swap_operations && length(indiv.ops) > 0])
         population.individuals = vcat(population.individuals, [mutate(indiv) for i=1:population.mutants_per_individual_per_type if rand() < population.p_mutate_operations && length(indiv.ops) > 0])
     end
@@ -192,11 +188,11 @@ end
 
 function run(population::Population)
     hist_dict = Dict{Tuple{Int64, String}, Int64}()
-    initialize_pop(population)
+    initialize_pop!(population)
     sort!(population)
     cull!(population)
     for i=1:population.max_gen
-        step(population)
+        step!(population)
         for hist in ["manual", "survivor", "random", "child", "drop_m", "gain_m", "swap_m", "ops_m"]
             hist_dict[(i, hist)] = reduce(+, [1 for indiv in population.individuals if indiv.history==hist], init=0)
             # hist_dict[hist] - array and then push on this
@@ -205,6 +201,8 @@ function run(population::Population)
     population.selection_history = hist_dict
 end
 
-pop = Population(15, 11, 14, p_zero, 0.9, 0.99, 0.99, 200, 20, 100, 10, 6, 20, 3, 5, 0.1, 0.9, 0.7, 0.8, 0.8, [], Dict(), 10)
-@benchmark run(pop)
+pop = Population(15, 11, 14, p_two_one_zero, 0.9, 0.99, 0.99, 200, 20, 100, 10, 6, 20, 3, 5, 0.1, 0.9, 0.7, 0.8, 0.8, [], Dict(), 10)
+run(pop)
+
+
 
