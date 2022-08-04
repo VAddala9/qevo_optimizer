@@ -15,15 +15,10 @@ mutable struct Individual
     r::Int
     f_in::Float64
     cost_function # function that takes in Performance type and returns a number
-    ops::Vector{Any}
+    ops::Vector{Union{PauliNoiseBellGate,NoisyBellMeasureNoisyReset}}
     performance::Performance
     fitness::Float64
 end 
-
-struct SimulationObject 
-    successes::Vector{Bool} # each element corresponds to one monte carlo run
-    bell_states::Vector{BellState}
-end
 
 p_zero(p::Performance)=p.error_probabilities[1]
 p_one_zero(p::Performance)=sum(p.error_probabilities[1:2])
@@ -32,8 +27,13 @@ p_two_one_zero(p::Performance)=sum(p.error_probabilities[1:3])
 function calculate_performance!(indiv::Individual, num_simulations=10) # later pass in min_accuracy instead of num_simulations
     all_resulting_pairs = Vector{BellState}()
     all_successes = Vector{Bool}()
+    state = BellState(indiv.r)
+    px0 = py0 = pz0 = (1-indiv.f_in)/4
+    initial_noise_circuit = [PauliNoise(i, px0, py0, pz0) for i in 1:indiv.r]
     for i=1:num_simulations
-        resulting_pairs, success = mctrajectory!(BellState(zeros(Bool, 2*indiv.r)), indiv.ops)
+        new_state = copy(state)
+        mctrajectory!(new_state, initial_noise_circuit)
+        resulting_pairs, success = mctrajectory!(new_state, indiv.ops)
         push!(all_resulting_pairs, resulting_pairs)
         push!(all_successes, success==QuantumClifford.Experimental.NoisyCircuits.CircuitStatus(0))
     end
@@ -57,11 +57,17 @@ function drop_op(indiv::Individual)
     return new_indiv
 end
 
-function gain_op(indiv::Individual, p2::Float64)
+function gain_op(indiv::Individual, p2::Float64, η::Float64)
     new_indiv = deepcopy(indiv)
     px = py = pz = (1 - p2)/4
-    rand_op = rand() < 0.7 ? PauliNoiseBellGate(rand(BellGate, randperm(indiv.k)[1:2]...), px, py, pz) : rand(BellMeasure, rand(1:indiv.k))
-    insert!(new_indiv.ops, rand(1:length(new_indiv.ops)), rand_op)
+    px0 = py0 = pz0 = (1-indiv.f_in)/4
+    rand_op = rand() < 0.7 ? PauliNoiseBellGate(rand(BellGate, randperm(indiv.k)[1:2]...), px, py, pz) : NoisyBellMeasureNoisyReset(rand(BellMeasure, rand(1:indiv.k)), η, px0, py0, pz0)
+    if length(new_indiv.ops) == 0
+        push!(new_indiv.ops, rand(1:length(new_indiv.ops)), rand_op)
+    else
+        insert!(new_indiv.ops, rand(1:length(new_indiv.ops)), rand_op)
+    end
+
     new_indiv.history = "gain_m"
     return new_indiv
 end
@@ -76,8 +82,8 @@ function swap_op(indiv::Individual)
     return new_indiv
 end
 
-function mutate(gate::BellMeasure)
-    return rand(BellMeasure, gate.sidx)
+function mutate(gate::NoisyBellMeasureNoisyReset)
+    return NoisyBellMeasureNoisyReset(rand(BellMeasure, gate.m.sidx), gate.p, gate.px, gate.py, gate.pz)
 end
 
 function mutate(gate::PauliNoiseBellGate)
@@ -96,6 +102,9 @@ function new_child(indiv::Individual, indiv2::Individual)
     ops1, ops2 = indiv.ops, indiv2.ops
     if rand() < 0.5
         ops1 = ops1[end:-1:1]
+    end
+    if length(ops1) == 0 || length(ops2) == 0
+        return new_indiv
     end
 
     if rand() < 0.5
@@ -141,15 +150,16 @@ mutable struct Population
 end
 
 function initialize_pop!(population::Population)
-    population.individuals = [Individual("random", population.k, population.r, population.f_in, population.cost_function, [], Performance([], 0.0), 0.0) for i=1:population.population_size*population.starting_pop_multiplier]
+    population.individuals = [Individual("random", population.k, population.r, population.f_in, population.cost_function, Vector{Union{PauliNoiseBellGate,NoisyBellMeasureNoisyReset}}(), Performance([], 0.0), 0.0) for i=1:population.population_size*population.starting_pop_multiplier]
     Threads.@threads for indiv in population.individuals
         num_gates = rand(1:population.starting_ops-1)
         random_gates = [rand(BellGate, (randperm(population.r)[1:2])...) for _ in 1:num_gates]
         px = py = pz = (1 - population.p2)/4
+        px0 = py0 = pz0 = (1 - population.f_in)/4
         noisy_random_gates = [PauliNoiseBellGate(g, px, py, pz) for g in random_gates]
-        random_measurements = [rand(BellMeasure, rand(1:population.r)) for _ in 1:(population.starting_ops-num_gates)]
+        random_measurements = [NoisyBellMeasureNoisyReset(rand(BellMeasure, rand(1:population.r)), population.η, px0, py0, pz0) for _ in 1:(population.starting_ops-num_gates)]
         all_ops = vcat(noisy_random_gates, random_measurements)
-        random_circuit = all_ops[randperm(population.starting_ops)]
+        random_circuit = convert(Vector{Union{PauliNoiseBellGate,NoisyBellMeasureNoisyReset}}, all_ops[randperm(population.starting_ops)])
         indiv.ops = random_circuit
     end
 end
@@ -177,7 +187,7 @@ function step!(population::Population)
 
     for indiv in population.individuals[1:population.population_size]
         population.individuals = vcat(population.individuals, [drop_op(indiv) for i=1:population.mutants_per_individual_per_type if rand() < population.p_lose_operation && length(indiv.ops) > 0])
-        population.individuals = vcat(population.individuals, [gain_op(indiv, population.p2) for i=1:population.mutants_per_individual_per_type if rand() < population.p_add_operation && length(indiv.ops) < population.max_ops])
+        population.individuals = vcat(population.individuals, [gain_op(indiv, population.p2, population.η) for i=1:population.mutants_per_individual_per_type if rand() < population.p_add_operation && length(indiv.ops) < population.max_ops])
         population.individuals = vcat(population.individuals, [swap_op(indiv) for i=1:population.mutants_per_individual_per_type if rand() < population.p_swap_operations && length(indiv.ops) > 0])
         population.individuals = vcat(population.individuals, [mutate(indiv) for i=1:population.mutants_per_individual_per_type if rand() < population.p_mutate_operations && length(indiv.ops) > 0])
     end
@@ -186,7 +196,7 @@ function step!(population::Population)
     cull!(population)
 end
 
-function run(population::Population)
+function run!(population::Population)
     hist_dict = Dict{Tuple{Int64, String}, Int64}()
     initialize_pop!(population)
     sort!(population)
@@ -202,7 +212,7 @@ function run(population::Population)
 end
 
 pop = Population(15, 11, 14, p_two_one_zero, 0.9, 0.99, 0.99, 200, 20, 100, 10, 6, 20, 3, 5, 0.1, 0.9, 0.7, 0.8, 0.8, [], Dict(), 10)
-run(pop)
+run!(pop)
 
 
 
