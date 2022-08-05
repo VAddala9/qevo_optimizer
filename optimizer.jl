@@ -3,6 +3,7 @@ using QuantumClifford
 using QuantumClifford.Experimental.NoisyCircuits
 using Random
 using PyPlot
+using Statistics
 
 struct Performance
     error_probabilities::Vector{Float64}
@@ -28,7 +29,7 @@ function calculate_performance!(indiv::Individual, num_simulations=10) # later p
     all_resulting_pairs = Vector{BellState}()
     all_successes = Vector{Bool}()
     state = BellState(indiv.r)
-    px0 = py0 = pz0 = (1-indiv.f_in)/4
+    px0 = py0 = pz0 = (1-indiv.f_in)/3
     initial_noise_circuit = [PauliNoise(i, px0, py0, pz0) for i in 1:indiv.r]
     for i=1:num_simulations
         new_state = copy(state)
@@ -60,10 +61,10 @@ end
 function gain_op(indiv::Individual, p2::Float64, η::Float64)
     new_indiv = deepcopy(indiv)
     px = py = pz = (1 - p2)/4
-    px0 = py0 = pz0 = (1-indiv.f_in)/4
+    px0 = py0 = pz0 = (1-indiv.f_in)/3
     rand_op = rand() < 0.7 ? PauliNoiseBellGate(rand(BellGate, randperm(indiv.k)[1:2]...), px, py, pz) : NoisyBellMeasureNoisyReset(rand(BellMeasure, rand(1:indiv.k)), η, px0, py0, pz0)
     if length(new_indiv.ops) == 0
-        push!(new_indiv.ops, rand(1:length(new_indiv.ops)), rand_op)
+        push!(new_indiv.ops, rand_op)
     else
         insert!(new_indiv.ops, rand(1:length(new_indiv.ops)), rand_op)
     end
@@ -145,17 +146,17 @@ mutable struct Population
     p_swap_operations::Float64
     p_mutate_operations::Float64
     individuals::Vector{Individual}
-    selection_history::Dict{Tuple{Int64, String}, Int64}
+    selection_history::Dict{String, Vector{Int64}}
     num_simulations::Int
 end
 
 function initialize_pop!(population::Population)
-    population.individuals = [Individual("random", population.k, population.r, population.f_in, population.cost_function, Vector{Union{PauliNoiseBellGate,NoisyBellMeasureNoisyReset}}(), Performance([], 0.0), 0.0) for i=1:population.population_size*population.starting_pop_multiplier]
+    population.individuals = [Individual("random", population.k, population.r, population.f_in, population.cost_function, [], Performance([], 0.0), 0.0) for i=1:population.population_size*population.starting_pop_multiplier]
     Threads.@threads for indiv in population.individuals
         num_gates = rand(1:population.starting_ops-1)
         random_gates = [rand(BellGate, (randperm(population.r)[1:2])...) for _ in 1:num_gates]
         px = py = pz = (1 - population.p2)/4
-        px0 = py0 = pz0 = (1 - population.f_in)/4
+        px0 = py0 = pz0 = (1 - population.f_in)/3
         noisy_random_gates = [PauliNoiseBellGate(g, px, py, pz) for g in random_gates]
         random_measurements = [NoisyBellMeasureNoisyReset(rand(BellMeasure, rand(1:population.r)), population.η, px0, py0, pz0) for _ in 1:(population.starting_ops-num_gates)]
         all_ops = vcat(noisy_random_gates, random_measurements)
@@ -197,22 +198,29 @@ function step!(population::Population)
 end
 
 function run!(population::Population)
-    hist_dict = Dict{Tuple{Int64, String}, Int64}()
+    for hist in ["manual", "survivor", "random", "child", "drop_m", "gain_m", "swap_m", "ops_m"]
+        population.selection_history[hist] = Vector{Int64}()
+    end
     initialize_pop!(population)
     sort!(population)
     cull!(population)
     for i=1:population.max_gen
         step!(population)
         for hist in ["manual", "survivor", "random", "child", "drop_m", "gain_m", "swap_m", "ops_m"]
-            hist_dict[(i, hist)] = reduce(+, [1 for indiv in population.individuals if indiv.history==hist], init=0)
-            # hist_dict[hist] - array and then push on this
+            push!(population.selection_history[hist], reduce(+, [1 for indiv in population.individuals if indiv.history==hist], init=0))
         end
     end
-    population.selection_history = hist_dict
 end
 
-pop = Population(15, 11, 14, p_two_one_zero, 0.9, 0.99, 0.99, 200, 20, 100, 10, 6, 20, 3, 5, 0.1, 0.9, 0.7, 0.8, 0.8, [], Dict(), 10)
-run!(pop)
+#pop = Population(15, 11, 14, p_two_one_zero, 0.9, 0.99, 0.99, 200, 20, 100, 10, 6, 20, 3, 5, 0.1, 0.9, 0.7, 0.8, 0.8, [], Dict(), 100000)
+pop = Population(15, 2, 3, p_zero, 0.9, 0.99, 0.99, 200, 20, 100, 10, 6, 20, 3, 5, 0.1, 0.9, 0.7, 0.8, 0.8, [], Dict(), 10000)
+@time run!(pop)
 
+"""for hist in ["manual", "survivor", "random", "child", "drop_m", "gain_m", "swap_m", "ops_m"]
+    figure()
+    plot(pop.selection_history[hist])
+    display(gcf())
+end"""
 
-
+avg_measurements = mean([sum([1 for op in indiv.ops if isa(op, NoisyBellMeasureNoisyReset)]) for indiv in pop.individuals])
+avg_gates = mean([sum([1 for op in indiv.ops if isa(op, PauliNoiseBellGate)]) for indiv in pop.individuals])
