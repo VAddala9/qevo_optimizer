@@ -16,7 +16,7 @@ mutable struct Individual
     r::Int
     f_in::Float64
     cost_function # function that takes in Performance type and returns a number
-    ops::Vector{Union{PauliNoiseBellGate,NoisyBellMeasureNoisyReset}}
+    ops::Vector{Union{PauliNoiseBellGate{CNOTPerm},NoisyBellMeasureNoisyReset}}
     performance::Performance
     fitness::Float64
 end 
@@ -26,13 +26,14 @@ p_one_zero(p::Performance)=sum(p.error_probabilities[1:2])
 p_two_one_zero(p::Performance)=sum(p.error_probabilities[1:3])
     
 function calculate_performance!(indiv::Individual, num_simulations=10) # later pass in min_accuracy instead of num_simulations
-    all_resulting_pairs = Vector{BellState}()
+    all_resulting_pairs = Vector{BellState}() # Todo - create in advance and assign to individual
     all_successes = Vector{Bool}()
     state = BellState(indiv.r)
     px0 = py0 = pz0 = (1-indiv.f_in)/3
-    initial_noise_circuit = [PauliNoise(i, px0, py0, pz0) for i in 1:indiv.r]
+    initial_noise_circuit = [PauliNoiseOp(i, px0, py0, pz0) for i in 1:indiv.r]
+    new_state = copy(state)
     for i=1:num_simulations
-        new_state = copy(state)
+        new_state.phases .= state.phases
         mctrajectory!(new_state, initial_noise_circuit)
         resulting_pairs, success = mctrajectory!(new_state, indiv.ops)
         push!(all_resulting_pairs, resulting_pairs)
@@ -62,7 +63,7 @@ function gain_op(indiv::Individual, p2::Float64, η::Float64)
     new_indiv = deepcopy(indiv)
     px = py = pz = (1 - p2)/4
     px0 = py0 = pz0 = (1-indiv.f_in)/3
-    rand_op = rand() < 0.7 ? PauliNoiseBellGate(rand(BellGate, randperm(indiv.k)[1:2]...), px, py, pz) : NoisyBellMeasureNoisyReset(rand(BellMeasure, rand(1:indiv.k)), η, px0, py0, pz0)
+    rand_op = rand() < 0.7 ? PauliNoiseBellGate(rand(CNOTPerm, randperm(indiv.k)[1:2]...), px, py, pz) : NoisyBellMeasureNoisyReset(rand(BellMeasure, rand(1:indiv.k)), η, px0, py0, pz0)
     if length(new_indiv.ops) == 0
         push!(new_indiv.ops, rand_op)
     else
@@ -88,7 +89,7 @@ function mutate(gate::NoisyBellMeasureNoisyReset)
 end
 
 function mutate(gate::PauliNoiseBellGate)
-    return PauliNoiseBellGate(rand(BellGate, gate.g.idx1, gate.g.idx2), gate.px, gate.py, gate.pz)
+    return PauliNoiseBellGate(rand(CNOTPerm, gate.g.idx1, gate.g.idx2), gate.px, gate.py, gate.pz)
 end
 
 function mutate(indiv::Individual)
@@ -154,13 +155,13 @@ function initialize_pop!(population::Population)
     population.individuals = [Individual("random", population.k, population.r, population.f_in, population.cost_function, [], Performance([], 0.0), 0.0) for i=1:population.population_size*population.starting_pop_multiplier]
     Threads.@threads for indiv in population.individuals
         num_gates = rand(1:population.starting_ops-1)
-        random_gates = [rand(BellGate, (randperm(population.r)[1:2])...) for _ in 1:num_gates]
+        random_gates = [rand(CNOTPerm, (randperm(population.r)[1:2])...) for _ in 1:num_gates]
         px = py = pz = (1 - population.p2)/4
         px0 = py0 = pz0 = (1 - population.f_in)/3
         noisy_random_gates = [PauliNoiseBellGate(g, px, py, pz) for g in random_gates]
         random_measurements = [NoisyBellMeasureNoisyReset(rand(BellMeasure, rand(1:population.r)), population.η, px0, py0, pz0) for _ in 1:(population.starting_ops-num_gates)]
         all_ops = vcat(noisy_random_gates, random_measurements)
-        random_circuit = convert(Vector{Union{PauliNoiseBellGate,NoisyBellMeasureNoisyReset}}, all_ops[randperm(population.starting_ops)])
+        random_circuit = convert(Vector{Union{PauliNoiseBellGate{CNOTPerm},NoisyBellMeasureNoisyReset}}, all_ops[randperm(population.starting_ops)])
         indiv.ops = random_circuit
     end
 end
@@ -213,7 +214,7 @@ function run!(population::Population)
 end
 
 #pop = Population(15, 11, 14, p_two_one_zero, 0.9, 0.99, 0.99, 200, 20, 100, 10, 6, 20, 3, 5, 0.1, 0.9, 0.7, 0.8, 0.8, [], Dict(), 100000)
-pop = Population(15, 2, 3, p_zero, 0.9, 0.99, 0.99, 200, 20, 100, 10, 6, 20, 3, 5, 0.1, 0.9, 0.7, 0.8, 0.8, [], Dict(), 10000)
+pop = Population(15, 2, 3, p_zero, 0.9, 0.99, 0.99, 200, 20, 10, 10, 6, 20, 3, 5, 0.1, 0.9, 0.7, 0.8, 0.8, [], Dict(), 100)
 @time run!(pop)
 
 """for hist in ["manual", "survivor", "random", "child", "drop_m", "gain_m", "swap_m", "ops_m"]
@@ -224,3 +225,5 @@ end"""
 
 avg_measurements = mean([sum([1 for op in indiv.ops if isa(op, NoisyBellMeasureNoisyReset)]) for indiv in pop.individuals])
 avg_gates = mean([sum([1 for op in indiv.ops if isa(op, PauliNoiseBellGate)]) for indiv in pop.individuals])
+
+succ_probs = [indiv.performance.success_probability for indiv in pop.individuals]
