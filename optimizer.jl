@@ -1,9 +1,16 @@
+module Optimizer
+
 using BPGates
 using QuantumClifford
 using QuantumClifford.Experimental.NoisyCircuits
 using Random
-using PyPlot
+#using PyPlot
 using Statistics
+using Revise
+
+export Performance, Individual, p_zero, p_one_zero, p_two_one_zero,
+    calculate_performance!, Population, initialize_pop!, cull!, sort!,
+    step!, run!, fidelities, succ_probs
 
 struct Performance
     error_probabilities::Vector{Float64}
@@ -25,6 +32,45 @@ p_zero(p::Performance)=p.error_probabilities[1]
 p_one_zero(p::Performance)=sum(p.error_probabilities[1:2])
 p_two_one_zero(p::Performance)=sum(p.error_probabilities[1:3])
     
+
+function calculate_performance_new!(indiv::Individual, num_simulations=10) 
+    K = indiv.k
+    R = indiv.r
+    state = BellState(R)
+    count_success = 0
+    counts_marginals = zeros(Int,K) # an array to find F₁, F₂, …, Fₖ
+    counts_nb_errors = zeros(Int,K+1) # an array to find P₀, P₁, …, Pₖ -- Careful with indexing it!
+
+
+    px0 = py0 = pz0 = (1-indiv.f_in)/3
+    initial_noise_circuit = [PauliNoiseOp(i, px0, py0, pz0) for i in 1:indiv.r]
+    
+    for _ in 1:num_simulations
+        res_state, res = mctrajectory!(copy(state), initial_noise_circuit)
+        res_state, res = mctrajectory!(res_state,indiv.ops)
+        if res == continue_stat
+            count_success += 1
+            err_count = 0
+            for i in 1:K
+                if res_state.phases[2i-1] || res_state.phases[2i] # TODO write a better interface to get this data
+                    err_count += 1
+                else
+                    counts_marginals[i] += 1
+                end
+            end
+            counts_nb_errors[err_count+1] += 1
+        end
+    end
+
+    p_success = count_success / num_simulations
+    marginals = counts_marginals / count_success # it could have NaNs if count_success == 0
+    err_probs = counts_nb_errors / count_success # it could have NaNs if count_success == 0
+    indiv.performance = Performance(err_probs, p_success)
+    indiv.fitness = count_success > 30 ? indiv.cost_function(indiv.performance) : 0.0
+    indiv.performance
+end
+
+
 function calculate_performance!(indiv::Individual, num_simulations=10) 
     all_resulting_pairs = Vector{BellState}() # Todo - create in advance and assign to individual
     all_successes = Vector{Bool}()
@@ -41,15 +87,16 @@ function calculate_performance!(indiv::Individual, num_simulations=10)
 
     successful_runs = (all_successes .== 1)
     successes = sum(successful_runs)
-    if successes == 0
+    if successes < 30
         indiv.performance = Performance(zeros(Float64, indiv.k), 0.0)
-        return indiv.fitness = -1
+        return indiv.fitness = 0.0
     end
     success_probability = successes/num_simulations
     errors = [sum(all_resulting_pairs[i].phases[1:2:2*indiv.k] .| all_resulting_pairs[i].phases[2:2:2*indiv.k]) for i=1:num_simulations if successful_runs[i]]
     error_probabilities = [sum(errors .== i)/successes for i=0:indiv.k]
     indiv.performance = Performance(error_probabilities, success_probability)
     indiv.fitness = indiv.cost_function(indiv.performance)
+    indiv.performance
 end
 
 function drop_op(indiv::Individual) 
@@ -63,7 +110,7 @@ function gain_op(indiv::Individual, p2::Float64, η::Float64)
     new_indiv = deepcopy(indiv)
     px = py = pz = (1 - p2)/4
     px0 = py0 = pz0 = (1-indiv.f_in)/3
-    rand_op = rand() < 0.7 ? PauliNoiseBellGate(rand(CNOTPerm, randperm(indiv.k)[1:2]...), px, py, pz) : NoisyBellMeasureNoisyReset(rand(BellMeasure, rand(1:indiv.k)), 1-η, px0, py0, pz0)
+    rand_op = rand() < 0.7 ? PauliNoiseBellGate(rand(CNOTPerm, randperm(indiv.r)[1:2]...), px, py, pz) : NoisyBellMeasureNoisyReset(rand(BellMeasure, rand(1:indiv.r)), 1-η, px0, py0, pz0)
     if length(new_indiv.ops) == 0
         push!(new_indiv.ops, rand_op)
     else
@@ -99,7 +146,7 @@ function mutate(indiv::Individual)
     return new_indiv
 end
 
-function new_child(indiv::Individual, indiv2::Individual)
+function new_child(indiv::Individual, indiv2::Individual, max_ops::Int)
     new_indiv = deepcopy(indiv)
     ops1, ops2 = indiv.ops, indiv2.ops
     if rand() < 0.5
@@ -112,7 +159,7 @@ function new_child(indiv::Individual, indiv2::Individual)
     if rand() < 0.5
         ops2 = ops2[end:-1:1]
     end
-    new_indiv.ops = vcat(ops1[1:rand(1:length(ops1))], ops2[1:rand(1:length(ops2))])
+    new_indiv.ops = vcat(ops1[1:rand(1:min(length(ops1), max_ops))], ops2[1:rand(1:length(ops2))])[1:min(end, max_ops)]
     new_indiv.history = "child"
     return new_indiv
 end
@@ -184,7 +231,7 @@ function step!(population::Population)
 
     parents = [(rand(population.individuals), rand(population.individuals)) for i=1:population.pairs]
     for (p1, p2) in parents
-        population.individuals = vcat(population.individuals, [new_child(p1, p2) for j=1:population.children_per_pair])
+        population.individuals = vcat(population.individuals, [new_child(p1, p2, population.max_ops) for j=1:population.children_per_pair])
     end
 
     for indiv in population.individuals[1:population.population_size]
@@ -199,6 +246,7 @@ function step!(population::Population)
 end
 
 function run!(population::Population)
+    println(Threads.nthreads())
     for hist in ["manual", "survivor", "random", "child", "drop_m", "gain_m", "swap_m", "ops_m"]
         population.selection_history[hist] = Vector{Int64}()
     end
@@ -206,7 +254,6 @@ function run!(population::Population)
     sort!(population)
     cull!(population)
     for i=1:population.max_gen
-        println(i)
         step!(population)
         for hist in ["manual", "survivor", "random", "child", "drop_m", "gain_m", "swap_m", "ops_m"]
             push!(population.selection_history[hist], reduce(+, [1 for indiv in population.individuals if indiv.history==hist], init=0))
@@ -214,18 +261,13 @@ function run!(population::Population)
     end
 end
 
-#pop = Population(15, 11, 14, p_two_one_zero, 0.9, 0.99, 0.99, 200, 20, 100, 10, 6, 20, 3, 5, 0.1, 0.9, 0.7, 0.8, 0.8, [], Dict(), 100000)
-pop = Population(15, 2, 3, p_zero, 0.9, 0.99, 0.99, 200, 20, 50, 10, 6, 20, 3, 5, 0.1, 0.9, 0.7, 0.8, 0.8, [], Dict(), 100000)
-@time run!(pop)
+function fidelities(population::Population)
+    return [i.fitness for i in population.individuals]
+end
 
-"""for hist in ["manual", "survivor", "random", "child", "drop_m", "gain_m", "swap_m", "ops_m"]
-    figure()
-    plot(pop.selection_history[hist])
-    display(gcf())
-end"""
+function succ_probs(population::Population)
+    return [i.performance.success_probability for i in population.individuals]
+end
 
-avg_measurements = mean([sum([1 for op in indiv.ops if isa(op, NoisyBellMeasureNoisyReset)]) for indiv in pop.individuals])
-avg_gates = mean([sum([1 for op in indiv.ops if isa(op, PauliNoiseBellGate)]) for indiv in pop.individuals])
+end # module
 
-succ_probs = [indiv.performance.success_probability for indiv in pop.individuals]
-fidelities = [indiv.fitness for indiv in pop.individuals]
