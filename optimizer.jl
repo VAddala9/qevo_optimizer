@@ -7,10 +7,11 @@ using Random
 #using PyPlot
 using Statistics
 using Revise
+using Pandas
 
 export Performance, Individual, p_zero, p_one_zero, p_two_one_zero,
     calculate_performance!, Population, initialize_pop!, cull!, sort!,
-    step!, run!, fidelities, succ_probs
+    step!, run!, fidelities, succ_probs, renoise, total_raw_pairs # TODO - rethink this list
 
 struct Performance
     error_probabilities::Vector{Float64}
@@ -27,6 +28,26 @@ mutable struct Individual
     performance::Performance
     fitness::Float64
 end 
+
+function Base.hash(indiv::Individual)
+    return hash((Individual, indiv.history, indiv.k, indiv.r, indiv.f_in, indiv.cost_function, [hash(op) for op in indiv.ops])) # probably don't want to hash the fitness/performance since that is probabilistic; TODO - probably need to do something different with the ops hash
+end
+
+function Base.hash(g::CNOTPerm)
+    return hash((CNOTPerm, g.single1, g.single2, g.idx1, g.idx2))
+end
+
+function Base.hash(n::PauliNoiseBellGate{CNOTPerm})
+    return hash((PauliNoiseBellGate{CNOTPerm}, n.px, n.py, n.pz))
+end
+
+function Base.hash(m::BellMeasure)
+    return hash((BellMeasure, m.midx, m.sidx))
+end
+
+function Base.hash(n::NoisyBellMeasureNoisyReset)
+    return hash((NoisyBellMeasureNoisyReset, hash(n.m), n.p, n.px, n.py, n.pz))
+end
 
 p_zero(p::Performance)=p.error_probabilities[1]
 p_one_zero(p::Performance)=sum(p.error_probabilities[1:2])
@@ -164,8 +185,49 @@ function new_child(indiv::Individual, indiv2::Individual, max_ops::Int)
     return new_indiv
 end
 
-function total_raw_pairs(indiv::Individual) # priority 2
+function total_raw_pairs(indiv::Individual)
+    total = indiv.r
+    last_ops_reg = Set(1:indiv.r)
+    for op in reverse(indiv.ops)
+        if isa(op, NoisyBellMeasureNoisyReset)
+            t = op.m.sidx
+            if t in last_ops_reg
+                delete!(last_ops_reg, t)
+                if t < indiv.k
+                    total+=1
+                end
+            else
+                total+=1
+            end
+        else
+            for t in [op.g.idx1, op.g.idx2]
+                delete!(last_ops_reg, t)
+            end
+        end
+    end
+    return total
+end
 
+function f_in_to_pauli(f_in::Float64)
+    px = py = pz = (1-f_in)/3
+    return px, py, pz
+end
+
+function p2_to_pauli(p2::Float64)
+    px = py = pz = (1-p2)/4
+    return px, py, pz
+end
+
+function renoise(n::PauliNoiseBellGate{CNOTPerm}, f_in::Float64, p2::Float64)
+    return PauliNoiseBellGate{CNOTPerm}(n.g, p2_to_pauli(p2)...)
+end
+
+function renoise(n::NoisyBellMeasureNoisyReset, f_in::Float64, p2::Float64)
+    return NoisyBellMeasureNoisyReset(n.m, 1-p2, f_in_to_pauli(f_in)...)
+end
+
+function renoise(indiv::Individual, f_in::Float64, p2::Float64)
+    return Individual(indiv.history, indiv.k, indiv.r, f_in, indiv.cost_function, [renoise(op, f_in, p2) for op in indiv.ops], Performance([], 0), 0)
 end
 
 function generate_dataframe() # priority 3
