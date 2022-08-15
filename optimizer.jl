@@ -11,7 +11,7 @@ using Pandas
 
 export Performance, Individual, p_zero, p_one_zero, p_two_one_zero,
     calculate_performance!, Population, initialize_pop!, cull!, sort!,
-    step!, run!, fidelities, succ_probs, renoise, total_raw_pairs # TODO - rethink this list
+    step!, run!, fidelities, succ_probs, renoise, total_raw_pairs, generate_dataframe # TODO - rethink this list
 
 struct Performance
     error_probabilities::Vector{Float64}
@@ -230,10 +230,6 @@ function renoise(indiv::Individual, f_in::Float64, p2::Float64)
     return Individual(indiv.history, indiv.k, indiv.r, f_in, indiv.cost_function, [renoise(op, f_in, p2) for op in indiv.ops], Performance([], 0), 0)
 end
 
-function generate_dataframe() # priority 3
-
-end
-
 mutable struct Population
     n::Int
     k::Int
@@ -258,6 +254,48 @@ mutable struct Population
     individuals::Vector{Individual}
     selection_history::Dict{String, Vector{Int64}}
     num_simulations::Int
+end
+
+function generate_dataframe(population::Population, f_ins, p2s, num_simulations, save_to)
+    dataframe_length = length(population.individuals)*length(f_ins)*length(p2s)
+    r = zeros(dataframe_length)
+    k = zeros(dataframe_length)
+    n = zeros(dataframe_length)
+    circuit_length = zeros(dataframe_length)
+    fitness = zeros(dataframe_length)
+    success_probability = zeros(dataframe_length)
+    f_in = zeros(dataframe_length)
+    p2 = zeros(dataframe_length)
+    circuit_hash = zeros(dataframe_length)
+    individual = repeat([""], dataframe_length)
+
+    Threads.@threads for i1 in 1:length(population.individuals)
+        indiv = population.individuals[i1]
+        representative_indiv = renoise(indiv, 0.9, 0.99)
+        indiv_repr = repr(representative_indiv)
+        indiv_hash = hash(representative_indiv)
+        for i2 in 1:length(f_ins)
+            for i3 in 1:length(p2s)
+                f = f_ins[i2]
+                p = p2s[i3]
+                index = (i1-1)*length(f_ins)*length(p2s) + (i2-1)*length(p2s) + (i3-1) + 1
+                new_indiv = renoise(indiv, f, p)
+                calculate_performance!(new_indiv, num_simulations)
+                n[index] = total_raw_pairs(new_indiv)
+                r[index] = new_indiv.r
+                k[index] = new_indiv.k
+                circuit_length[index] = length(new_indiv.ops)
+                fitness[index] = new_indiv.fitness
+                success_probability[index] = new_indiv.performance.success_probability
+                f_in[index] = f
+                p2[index] = p
+                circuit_hash[index] = indiv_hash
+                individual[index] = indiv_repr
+            end
+        end
+    end
+    df = DataFrame(Dict(:n=>n, :r=>r, :k=>k, :circuit_length=>circuit_length, :fitness=>fitness, :success_probability=>success_probability, :f_in=>f_in, :p2=>p2, :circuit_hash=>circuit_hash, :individual=>individual))
+    to_csv(df, save_to)
 end
 
 function initialize_pop!(population::Population)
