@@ -15,6 +15,9 @@ export Performance, Individual, p_zero, p_one_zero, p_two_one_zero,
 
 struct Performance
     error_probabilities::Vector{Float64}
+    purified_pairs_fidelity::Float64
+    logical_qubit_fidelity::Float64
+    avg_marginals::Float64
     success_probability::Float64
 end
 
@@ -23,14 +26,15 @@ mutable struct Individual
     k::Int
     r::Int
     f_in::Float64
-    cost_function # function that takes in Performance type and returns a number
+    code_distance::Int
     ops::Vector{Union{PauliNoiseBellGate{CNOTPerm},NoisyBellMeasureNoisyReset}}
     performance::Performance
     fitness::Float64
+    optimize_marginals::Bool
 end 
 
 function Base.hash(indiv::Individual)
-    return hash((Individual, indiv.history, indiv.k, indiv.r, indiv.f_in, indiv.cost_function, [hash(op) for op in indiv.ops])) # probably don't want to hash the fitness/performance since that is probabilistic; TODO - probably need to do something different with the ops hash
+    return hash((Individual, indiv.k, indiv.r, [hash(op) for op in indiv.ops]))
 end
 
 function Base.hash(g::CNOTPerm)
@@ -49,12 +53,7 @@ function Base.hash(n::NoisyBellMeasureNoisyReset)
     return hash((NoisyBellMeasureNoisyReset, hash(n.m), n.p, n.px, n.py, n.pz))
 end
 
-p_zero(p::Performance)=p.error_probabilities[1]
-p_one_zero(p::Performance)=sum(p.error_probabilities[1:2])
-p_two_one_zero(p::Performance)=sum(p.error_probabilities[1:3])
-    
-
-function calculate_performance_new!(indiv::Individual, num_simulations=10) 
+function calculate_performance!(indiv::Individual, num_simulations=10) 
     K = indiv.k
     R = indiv.r
     state = BellState(R)
@@ -85,37 +84,12 @@ function calculate_performance_new!(indiv::Individual, num_simulations=10)
     p_success = count_success / num_simulations
     marginals = counts_marginals / count_success # it could have NaNs if count_success == 0
     err_probs = counts_nb_errors / count_success # it could have NaNs if count_success == 0
-    indiv.performance = Performance(err_probs, p_success)
-    indiv.fitness = count_success > 30 ? indiv.cost_function(indiv.performance) : 0.0
-    indiv.performance
-end
+    correctable_errors = div(indiv.code_distance - 1, 2)
+    logical_qubit_fidelity = sum(err_probs[1:min(end, correctable_errors+1)])
+    indiv.performance = Performance(err_probs, err_probs[1], logical_qubit_fidelity, mean(marginals), p_success)
 
-
-function calculate_performance!(indiv::Individual, num_simulations=10) 
-    all_resulting_pairs = Vector{BellState}() # Todo - create in advance and assign to individual
-    all_successes = Vector{Bool}()
-    state = BellState(indiv.r)
-    initial_noise_circuit = [PauliNoiseOp(i, f_in_to_pauli(indiv.f_in)...) for i in 1:indiv.r]
-    for i=1:num_simulations
-        new_state = copy(state)
-        mctrajectory!(new_state, initial_noise_circuit)
-        resulting_pairs, success = mctrajectory!(new_state, indiv.ops)
-        push!(all_resulting_pairs, resulting_pairs)
-        push!(all_successes, success==QuantumClifford.Experimental.NoisyCircuits.CircuitStatus(0))
-    end
-
-    successful_runs = (all_successes .== 1)
-    successes = sum(successful_runs)
-    if successes < 30
-        indiv.performance = Performance(zeros(Float64, indiv.k), 0.0)
-        return indiv.fitness = 0.0
-    end
-    success_probability = successes/num_simulations
-    errors = [sum(all_resulting_pairs[i].phases[1:2:2*indiv.k] .| all_resulting_pairs[i].phases[2:2:2*indiv.k]) for i=1:num_simulations if successful_runs[i]]
-    error_probabilities = [sum(errors .== i)/successes for i=0:indiv.k]
-    indiv.performance = Performance(error_probabilities, success_probability)
-    indiv.fitness = indiv.cost_function(indiv.performance)
-    indiv.performance
+    indiv.fitness = indiv.optimize_marginals ? indiv.performance.avg_marginals : indiv.performance.logical_qubit_fidelity
+    indiv.fitness = count_success > 0 ? indiv.fitness : 0.0
 end
 
 function drop_op(indiv::Individual) 
@@ -223,14 +197,15 @@ function renoise(n::NoisyBellMeasureNoisyReset, f_in::Float64, p2::Float64)
 end
 
 function renoise(indiv::Individual, f_in::Float64, p2::Float64)
-    return Individual(indiv.history, indiv.k, indiv.r, f_in, indiv.cost_function, [renoise(op, f_in, p2) for op in indiv.ops], Performance([], 0), 0)
+    return Individual(indiv.history, indiv.k, indiv.r, f_in, indiv.code_distance, [renoise(op, f_in, p2) for op in indiv.ops], Performance([], 0, 0, 0, 0), 0, indiv.optimize_marginals)
 end
 
 mutable struct Population
     n::Int
     k::Int
     r::Int
-    cost_function
+    code_distance::Int
+    optimize_marginals::Bool
     f_in::Float64
     p2::Float64
     η::Float64
@@ -254,12 +229,17 @@ end
 
 function generate_dataframe(population::Population, f_ins, p2s, num_simulations, save_to)
     dataframe_length = length(population.individuals)*length(f_ins)*length(p2s)
-    r = zeros(dataframe_length)
+    r = zeros(dataframe_length) # TODO - give all of these types
     k = zeros(dataframe_length)
     n = zeros(dataframe_length)
     circuit_length = zeros(dataframe_length)
-    fitness = zeros(dataframe_length)
+    purified_pairs_fidelity = zeros(dataframe_length)
+    logical_qubit_fidelity = zeros(dataframe_length)
+    code_distance = zeros(dataframe_length)
+    optimizing_marginals = zeros(dataframe_length)
+    avg_marginals = zeros(dataframe_length)
     success_probability = zeros(dataframe_length)
+    error_probabilities = repeat([[0.0]], dataframe_length)
     f_in = zeros(dataframe_length)
     p2 = zeros(dataframe_length)
     circuit_hash = zeros(dataframe_length)
@@ -281,7 +261,10 @@ function generate_dataframe(population::Population, f_ins, p2s, num_simulations,
                 r[index] = new_indiv.r
                 k[index] = new_indiv.k
                 circuit_length[index] = length(new_indiv.ops)
-                fitness[index] = new_indiv.fitness
+                purified_pairs_fidelity[index] = new_indiv.performance.purified_pairs_fidelity
+                logical_qubit_fidelity[index] = new_indiv.performance.logical_qubit_fidelity
+                error_probabilities[index] = new_indiv.performance.error_probabilities
+                avg_marginals[index] = new_indiv.performance.avg_marginals
                 success_probability[index] = new_indiv.performance.success_probability
                 f_in[index] = f
                 p2[index] = p
@@ -290,12 +273,12 @@ function generate_dataframe(population::Population, f_ins, p2s, num_simulations,
             end
         end
     end
-    df = DataFrame(Dict(:n=>n, :r=>r, :k=>k, :circuit_length=>circuit_length, :fitness=>fitness, :success_probability=>success_probability, :f_in=>f_in, :p2=>p2, :circuit_hash=>circuit_hash, :individual=>individual))
+    df = DataFrame(Dict(:error_probabilities=>error_probabilities, :n=>n, :r=>r, :k=>k, :circuit_length=>circuit_length, :purified_pairs_fidelity=>purified_pairs_fidelity, :logical_qubit_fidelity=>logical_qubit_fidelity, :avg_marginals=>avg_marginals, :success_probability=>success_probability, :f_in=>f_in, :p2=>p2, :circuit_hash=>circuit_hash, :individual=>individual))
     to_csv(df, save_to)
 end
 
 function initialize_pop!(population::Population)
-    population.individuals = [Individual("random", population.k, population.r, population.f_in, population.cost_function, [], Performance([], 0.0), 0.0) for i=1:population.population_size*population.starting_pop_multiplier]
+    population.individuals = [Individual("random", population.k, population.r, population.f_in, population.code_distance, [], Performance([], 0, 0, 0, 0), 0, population.optimize_marginals) for i=1:population.population_size*population.starting_pop_multiplier]
     Threads.@threads for indiv in population.individuals
         num_gates = rand(1:population.starting_ops-1)
         random_gates = [rand(CNOTPerm, (randperm(population.r)[1:2])...) for _ in 1:num_gates]
