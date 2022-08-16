@@ -63,8 +63,7 @@ function calculate_performance_new!(indiv::Individual, num_simulations=10)
     counts_nb_errors = zeros(Int,K+1) # an array to find P₀, P₁, …, Pₖ -- Careful with indexing it!
 
 
-    px0 = py0 = pz0 = (1-indiv.f_in)/3
-    initial_noise_circuit = [PauliNoiseOp(i, px0, py0, pz0) for i in 1:indiv.r]
+    initial_noise_circuit = [PauliNoiseOp(i, f_in_to_pauli(indiv.f_in)...) for i in 1:indiv.r]
     
     for _ in 1:num_simulations
         res_state, res = mctrajectory!(copy(state), initial_noise_circuit)
@@ -96,8 +95,7 @@ function calculate_performance!(indiv::Individual, num_simulations=10)
     all_resulting_pairs = Vector{BellState}() # Todo - create in advance and assign to individual
     all_successes = Vector{Bool}()
     state = BellState(indiv.r)
-    px0 = py0 = pz0 = (1-indiv.f_in)/3
-    initial_noise_circuit = [PauliNoiseOp(i, px0, py0, pz0) for i in 1:indiv.r]
+    initial_noise_circuit = [PauliNoiseOp(i, f_in_to_pauli(indiv.f_in)...) for i in 1:indiv.r]
     for i=1:num_simulations
         new_state = copy(state)
         mctrajectory!(new_state, initial_noise_circuit)
@@ -129,9 +127,7 @@ end
 
 function gain_op(indiv::Individual, p2::Float64, η::Float64)
     new_indiv = deepcopy(indiv)
-    px = py = pz = (1 - p2)/4
-    px0 = py0 = pz0 = (1-indiv.f_in)/3
-    rand_op = rand() < 0.7 ? PauliNoiseBellGate(rand(CNOTPerm, randperm(indiv.r)[1:2]...), px, py, pz) : NoisyBellMeasureNoisyReset(rand(BellMeasure, rand(1:indiv.r)), 1-η, px0, py0, pz0)
+    rand_op = rand() < 0.7 ? PauliNoiseBellGate(rand(CNOTPerm, randperm(indiv.r)[1:2]...), p2_to_pauli(p2)...) : NoisyBellMeasureNoisyReset(rand(BellMeasure, rand(1:indiv.r)), 1-η, f_in_to_pauli(indiv.f_in)...)
     if length(new_indiv.ops) == 0
         push!(new_indiv.ops, rand_op)
     else
@@ -303,10 +299,8 @@ function initialize_pop!(population::Population)
     Threads.@threads for indiv in population.individuals
         num_gates = rand(1:population.starting_ops-1)
         random_gates = [rand(CNOTPerm, (randperm(population.r)[1:2])...) for _ in 1:num_gates]
-        px = py = pz = (1 - population.p2)/4
-        px0 = py0 = pz0 = (1 - population.f_in)/3
-        noisy_random_gates = [PauliNoiseBellGate(g, px, py, pz) for g in random_gates]
-        random_measurements = [NoisyBellMeasureNoisyReset(rand(BellMeasure, rand(1:population.r)), 1-population.η, px0, py0, pz0) for _ in 1:(population.starting_ops-num_gates)]
+        noisy_random_gates = [PauliNoiseBellGate(g, p2_to_pauli(population.p2)...) for g in random_gates]
+        random_measurements = [NoisyBellMeasureNoisyReset(rand(BellMeasure, rand(1:population.r)), 1-population.η, f_in_to_pauli(population.f_in)...) for _ in 1:(population.starting_ops-num_gates)]
         all_ops = vcat(noisy_random_gates, random_measurements)
         random_circuit = convert(Vector{Union{PauliNoiseBellGate{CNOTPerm},NoisyBellMeasureNoisyReset}}, all_ops[randperm(population.starting_ops)])
         indiv.ops = random_circuit
