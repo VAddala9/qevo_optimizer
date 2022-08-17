@@ -11,15 +11,18 @@ using Pandas
 
 export Performance, Individual, p_zero, p_one_zero, p_two_one_zero,
     calculate_performance!, Population, initialize_pop!, cull!, sort!,
-    step!, run!, fidelities, succ_probs, renoise, total_raw_pairs, generate_dataframe # TODO - rethink this list
+    step!, run!, fidelities, succ_probs, renoise, total_raw_pairs, generate_dataframe,
+    CostFunction # TODO - rethink this list
 
 struct Performance
     error_probabilities::Vector{Float64}
     purified_pairs_fidelity::Float64
     logical_qubit_fidelity::Float64
-    avg_marginals::Float64
+    average_marginal_fidelity::Float64
     success_probability::Float64
 end
+
+@enum CostFunction logical_qubit_fidelity purified_pairs_fidelity average_marginal_fidelity
 
 mutable struct Individual
     history::String
@@ -30,7 +33,7 @@ mutable struct Individual
     ops::Vector{Union{PauliNoiseBellGate{CNOTPerm},NoisyBellMeasureNoisyReset}}
     performance::Performance
     fitness::Float64
-    optimize_marginals::Bool
+    optimize_for::CostFunction
 end 
 
 function Base.hash(indiv::Individual)
@@ -85,10 +88,18 @@ function calculate_performance!(indiv::Individual, num_simulations=10)
     marginals = counts_marginals / count_success # it could have NaNs if count_success == 0
     err_probs = counts_nb_errors / count_success # it could have NaNs if count_success == 0
     correctable_errors = div(indiv.code_distance - 1, 2)
-    logical_qubit_fidelity = sum(err_probs[1:min(end, correctable_errors+1)])
-    indiv.performance = Performance(err_probs, err_probs[1], logical_qubit_fidelity, mean(marginals), p_success)
+    indiv_logical_qubit_fidelity = sum(err_probs[1:min(end, correctable_errors+1)])
+    indiv.performance = Performance(err_probs, err_probs[1], indiv_logical_qubit_fidelity, mean(marginals), p_success)
 
-    indiv.fitness = indiv.optimize_marginals ? indiv.performance.avg_marginals : indiv.performance.logical_qubit_fidelity
+    if indiv.optimize_for == logical_qubit_fidelity
+        indiv.fitness = indiv.performance.logical_qubit_fidelity
+        
+    elseif indiv.optimize_for == purified_pairs_fidelity
+        indiv.fitness = indiv.performance.purified_pairs_fidelity
+        
+    elseif indiv.optimize_for == average_marginal_fidelity
+        indiv.fitness = indiv.performance.average_marginal_fidelity
+    end
     indiv.fitness = count_success > 0 ? indiv.fitness : 0.0
 end
 
@@ -197,7 +208,7 @@ function renoise(n::NoisyBellMeasureNoisyReset, f_in::Float64, p2::Float64)
 end
 
 function renoise(indiv::Individual, f_in::Float64, p2::Float64)
-    return Individual(indiv.history, indiv.k, indiv.r, f_in, indiv.code_distance, [renoise(op, f_in, p2) for op in indiv.ops], Performance([], 0, 0, 0, 0), 0, indiv.optimize_marginals)
+    return Individual(indiv.history, indiv.k, indiv.r, f_in, indiv.code_distance, [renoise(op, f_in, p2) for op in indiv.ops], Performance([], 0, 0, 0, 0), 0, indiv.optimize_for)
 end
 
 mutable struct Population
@@ -205,7 +216,7 @@ mutable struct Population
     k::Int
     r::Int
     code_distance::Int
-    optimize_marginals::Bool
+    optimize_for::CostFunction
     f_in::Float64
     p2::Float64
     η::Float64
@@ -227,8 +238,8 @@ mutable struct Population
     num_simulations::Int
 end
 
-function generate_dataframe(population::Population, f_ins, p2s, num_simulations, save_to)
-    dataframe_length = length(population.individuals)*length(f_ins)*length(p2s)
+function generate_dataframe(population::Population, num_individuals, f_ins, p2s, num_simulations, save_to)
+    dataframe_length = num_individuals*length(f_ins)*length(p2s)
     r = zeros(dataframe_length) # TODO - give all of these types
     k = zeros(dataframe_length)
     n = zeros(dataframe_length)
@@ -236,8 +247,8 @@ function generate_dataframe(population::Population, f_ins, p2s, num_simulations,
     purified_pairs_fidelity = zeros(dataframe_length)
     logical_qubit_fidelity = zeros(dataframe_length)
     code_distance = zeros(dataframe_length)
-    optimizing_marginals = zeros(dataframe_length)
-    avg_marginals = zeros(dataframe_length)
+    optimized_for = repeat([CostFunction(0)], dataframe_length)
+    average_marginal_fidelity = zeros(dataframe_length)
     success_probability = zeros(dataframe_length)
     error_probabilities = repeat([[0.0]], dataframe_length)
     f_in = zeros(dataframe_length)
@@ -245,7 +256,7 @@ function generate_dataframe(population::Population, f_ins, p2s, num_simulations,
     circuit_hash = zeros(dataframe_length)
     individual = repeat([""], dataframe_length)
 
-    Threads.@threads for i1 in 1:length(population.individuals)
+    Threads.@threads for i1 in 1:num_individuals
         indiv = population.individuals[i1]
         representative_indiv = renoise(indiv, 0.9, 0.99)
         indiv_repr = repr(representative_indiv)
@@ -260,11 +271,13 @@ function generate_dataframe(population::Population, f_ins, p2s, num_simulations,
                 n[index] = total_raw_pairs(new_indiv)
                 r[index] = new_indiv.r
                 k[index] = new_indiv.k
+                code_distance[index] = new_indiv.code_distance
+                optimized_for[index] = new_indiv.optimize_for
                 circuit_length[index] = length(new_indiv.ops)
                 purified_pairs_fidelity[index] = new_indiv.performance.purified_pairs_fidelity
                 logical_qubit_fidelity[index] = new_indiv.performance.logical_qubit_fidelity
                 error_probabilities[index] = new_indiv.performance.error_probabilities
-                avg_marginals[index] = new_indiv.performance.avg_marginals
+                average_marginal_fidelity[index] = new_indiv.performance.average_marginal_fidelity
                 success_probability[index] = new_indiv.performance.success_probability
                 f_in[index] = f
                 p2[index] = p
@@ -273,12 +286,13 @@ function generate_dataframe(population::Population, f_ins, p2s, num_simulations,
             end
         end
     end
-    df = DataFrame(Dict(:error_probabilities=>error_probabilities, :n=>n, :r=>r, :k=>k, :circuit_length=>circuit_length, :purified_pairs_fidelity=>purified_pairs_fidelity, :logical_qubit_fidelity=>logical_qubit_fidelity, :avg_marginals=>avg_marginals, :success_probability=>success_probability, :f_in=>f_in, :p2=>p2, :circuit_hash=>circuit_hash, :individual=>individual))
+    df = DataFrame(Dict(:error_probabilities=>error_probabilities, :n=>n, :r=>r, :k=>k, :circuit_length=>circuit_length, :purified_pairs_fidelity=>purified_pairs_fidelity, :logical_qubit_fidelity=>logical_qubit_fidelity, :average_marginal_fidelity=>average_marginal_fidelity, :success_probability=>success_probability, :f_in=>f_in, :p2=>p2, :circuit_hash=>circuit_hash, :individual=>individual, :code_distance=>code_distance, :optimized_for=>optimized_for))
     to_csv(df, save_to)
+    df
 end
 
 function initialize_pop!(population::Population)
-    population.individuals = [Individual("random", population.k, population.r, population.f_in, population.code_distance, [], Performance([], 0, 0, 0, 0), 0, population.optimize_marginals) for i=1:population.population_size*population.starting_pop_multiplier]
+    population.individuals = [Individual("random", population.k, population.r, population.f_in, population.code_distance, [], Performance([], 0, 0, 0, 0), 0, population.optimize_for) for i=1:population.population_size*population.starting_pop_multiplier]
     Threads.@threads for indiv in population.individuals
         num_gates = rand(1:population.starting_ops-1)
         random_gates = [rand(CNOTPerm, (randperm(population.r)[1:2])...) for _ in 1:num_gates]
@@ -323,7 +337,6 @@ function step!(population::Population)
 end
 
 function run!(population::Population)
-    println(Threads.nthreads())
     for hist in ["manual", "survivor", "random", "child", "drop_m", "gain_m", "swap_m", "ops_m"]
         population.selection_history[hist] = Vector{Int64}()
     end
