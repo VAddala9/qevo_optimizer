@@ -15,11 +15,11 @@ export Performance, Individual, p_zero, p_one_zero, p_two_one_zero,
     CostFunction # TODO - rethink this list
 
 struct Performance
-    error_probabilities::Vector{Float64}
-    purified_pairs_fidelity::Float64
-    logical_qubit_fidelity::Float64
-    average_marginal_fidelity::Float64
-    success_probability::Float64
+    error_probabilities::Vector{Float64} # at each index i, the probability of (i-1)-bell-pair errors occurring in the purified pairs
+    purified_pairs_fidelity::Float64 # a measure of how often none of the purified pairs will have an error
+    logical_qubit_fidelity::Float64 # the fidelity of the logical qubit, as measured after teleportation with the purified bell pairs followed by error correction
+    average_marginal_fidelity::Float64 # the average marginal fidelity of all purified pairs (note: correlation of errors is ignored here)
+    success_probability::Float64 # the proportion of protocols that do not have detected errors (Alice and Bob do not measure any errors)
 end
 
 @enum CostFunction logical_qubit_fidelity purified_pairs_fidelity average_marginal_fidelity
@@ -68,27 +68,27 @@ function calculate_performance!(indiv::Individual, num_simulations=10)
     initial_noise_circuit = [PauliNoiseOp(i, f_in_to_pauli(indiv.f_in)...) for i in 1:indiv.r]
     
     for _ in 1:num_simulations
-        res_state, res = mctrajectory!(copy(state), initial_noise_circuit)
-        res_state, res = mctrajectory!(res_state,indiv.ops)
+        res_state, res = mctrajectory!(copy(state), initial_noise_circuit) # monte carlo simulation of raw bell pair fidelity
+        res_state, res = mctrajectory!(res_state,indiv.ops) # monte carlo simulation of gates being applied on the bell pairs
         if res == continue_stat
             count_success += 1
             err_count = 0
-            for i in 1:K
-                if res_state.phases[2i-1] || res_state.phases[2i] # TODO write a better interface to get this data
+            for i in 1:K # for each purified pair
+                if res_state.phases[2i-1] || res_state.phases[2i] # checks whether an error has occurred based on binary representation in BPGates
                     err_count += 1
                 else
-                    counts_marginals[i] += 1
+                    counts_marginals[i] += 1 # in this simulation the i'th purified pair is in the desired state (no error)
                 end
             end
             counts_nb_errors[err_count+1] += 1
         end
     end
 
-    p_success = count_success / num_simulations
-    marginals = counts_marginals / count_success # it could have NaNs if count_success == 0
-    err_probs = counts_nb_errors / count_success # it could have NaNs if count_success == 0
-    correctable_errors = div(indiv.code_distance - 1, 2)
-    indiv_logical_qubit_fidelity = sum(err_probs[1:min(end, correctable_errors+1)])
+    p_success = count_success / num_simulations # proportion of simulations which has undetected errors
+    marginals = counts_marginals / count_success # marginal fidelities of purified pairs
+    err_probs = counts_nb_errors / count_success # an array containing in each index i, how many (i-1)-bell-pair errors occurred
+    correctable_errors = div(indiv.code_distance - 1, 2) # based on the distance of the error correcting code applied after teleportation, errors on a certain number of purified pairs can be corrected
+    indiv_logical_qubit_fidelity = sum(err_probs[1:min(end, correctable_errors+1)]) # the logical qubit fidelity is not decreased for any correctable errors (determined by code distance)
     indiv.performance = Performance(err_probs, err_probs[1], indiv_logical_qubit_fidelity, mean(marginals), p_success)
 
     if indiv.optimize_for == logical_qubit_fidelity
@@ -238,11 +238,15 @@ mutable struct Population
     num_simulations::Int
 end
 
+""" create a dataframe with statistics (mainly from the Performance struct) for num_individuals circuits
+from simulations of a population of circuits at different raw bell pair fidelities (f_ins) and gate fidelities (p2s). 
+save_to specifies the name of the file the dataframe will be saved to
+"""
 function generate_dataframe(population::Population, num_individuals, f_ins, p2s, num_simulations, save_to)
     dataframe_length = num_individuals*length(f_ins)*length(p2s)
-    r = zeros(dataframe_length) # TODO - give all of these types
-    k = zeros(dataframe_length)
-    n = zeros(dataframe_length)
+    r = zeros(dataframe_length) # number of registers
+    k = zeros(dataframe_length) # number of purified pairs
+    n = zeros(dataframe_length) # number of raw bell pairs
     circuit_length = zeros(dataframe_length)
     purified_pairs_fidelity = zeros(dataframe_length)
     logical_qubit_fidelity = zeros(dataframe_length)
@@ -251,14 +255,14 @@ function generate_dataframe(population::Population, num_individuals, f_ins, p2s,
     average_marginal_fidelity = zeros(dataframe_length)
     success_probability = zeros(dataframe_length)
     error_probabilities = repeat([[0.0]], dataframe_length)
-    f_in = zeros(dataframe_length)
-    p2 = zeros(dataframe_length)
+    f_in = zeros(dataframe_length) # raw bell pair fidelities
+    p2 = zeros(dataframe_length) # gate fidelities
     circuit_hash = zeros(dataframe_length)
-    individual = repeat([""], dataframe_length)
+    individual = repeat([""], dataframe_length) # representation of the Julia individual circuit object
 
     Threads.@threads for i1 in 1:num_individuals
         indiv = population.individuals[i1]
-        representative_indiv = renoise(indiv, 0.9, 0.99)
+        representative_indiv = renoise(indiv, 0.9, 0.99) # for consistency in hashing of same circuit across different noise rates
         indiv_repr = repr(representative_indiv)
         indiv_hash = hash(representative_indiv)
         for i2 in 1:length(f_ins)
